@@ -1,9 +1,7 @@
-
 import io
 import os
 import re
 import sqlite3
-from datetime import date
 from typing import Optional
 
 import pandas as pd
@@ -65,9 +63,16 @@ def normalize_percent(series: pd.Series) -> pd.Series:
         .replace("", pd.NA)
     )
     numeric = pd.to_numeric(cleaned, errors="coerce")
-
     valid = numeric.dropna()
-    if not valid.empty and valid.max() <= 1.0:
+
+    if valid.empty:
+        return numeric
+
+    ratio_small = ((valid >= 0) & (valid <= 1.5)).mean()
+    median_val = valid.median()
+
+    # 샘플 데이터처럼 대부분이 0~1 범위(예: 0.77 = 77%)일 때 자동 변환
+    if ratio_small >= 0.9 and median_val <= 1.5:
         numeric = numeric * 100
 
     return numeric
@@ -88,10 +93,7 @@ def parse_optional_number(text: str) -> Optional[float]:
     if s in {"", "-", ".", "-."}:
         return None
 
-    try:
-        return float(s)
-    except ValueError:
-        raise ValueError("숫자 입력값 형식이 올바르지 않습니다.")
+    return float(s)
 
 
 def sms_true_mask(series: pd.Series) -> pd.Series:
@@ -174,12 +176,7 @@ st.caption("엑셀 업로드 → 조건 선택 → 리스트 추출 → xlsx 저
 uploaded_file = st.file_uploader("견본 또는 고객 xlsx 업로드", type=["xlsx"])
 
 if uploaded_file is not None:
-    try:
-        raw_df = load_excel(uploaded_file)
-    except Exception as e:
-        st.error(f"엑셀을 읽는 중 오류가 발생했습니다: {e}")
-        st.stop()
-
+    raw_df = load_excel(uploaded_file)
     st.success(f"업로드 완료: {uploaded_file.name} / {len(raw_df):,}행")
 
     amount_col = find_column(raw_df, ["실주문금액", "실결제금액"])
@@ -195,6 +192,7 @@ if uploaded_file is not None:
 
         with left:
             st.markdown("### 금액/비율")
+
             a1, a2 = st.columns(2)
             amount_min_text = a1.text_input("실주문금액 시작", value="", placeholder="예: 100000")
             amount_max_text = a2.text_input("실주문금액 끝", value="", placeholder="예: 299999")
@@ -209,6 +207,7 @@ if uploaded_file is not None:
 
         with right:
             st.markdown("### 기간")
+
             o1, o2 = st.columns(2)
             order_start = o1.date_input("주문일 시작", value=None, format="YYYY/MM/DD")
             order_end = o2.date_input("주문일 끝", value=None, format="YYYY/MM/DD")
@@ -236,8 +235,8 @@ if uploaded_file is not None:
             rate_max = parse_optional_number(rate_max_text)
             unit_min = parse_optional_number(unit_min_text)
             unit_max = parse_optional_number(unit_max_text)
-        except ValueError as e:
-            st.error(str(e))
+        except Exception:
+            st.error("숫자 입력 형식을 확인해 주세요.")
             st.stop()
 
         result = raw_df.copy()
@@ -245,50 +244,49 @@ if uploaded_file is not None:
         if amount_col:
             amount_series = normalize_currency(result[amount_col])
             if amount_min is not None:
-                result = result[amount_series >= amount_min]
+                result = result.loc[amount_series >= amount_min]
                 amount_series = amount_series.loc[result.index]
             if amount_max is not None:
-                result = result[amount_series <= amount_max]
+                result = result.loc[amount_series <= amount_max]
 
         if rate_col:
             rate_series = normalize_percent(result[rate_col])
             if rate_min is not None:
-                result = result[rate_series >= rate_min]
+                result = result.loc[rate_series >= rate_min]
                 rate_series = rate_series.loc[result.index]
             if rate_max is not None:
-                result = result[rate_series <= rate_max]
+                result = result.loc[rate_series <= rate_max]
 
         if unit_col:
             unit_series = normalize_currency(result[unit_col])
             if unit_min is not None:
-                result = result[unit_series >= unit_min]
+                result = result.loc[unit_series >= unit_min]
                 unit_series = unit_series.loc[result.index]
             if unit_max is not None:
-                result = result[unit_series <= unit_max]
+                result = result.loc[unit_series <= unit_max]
 
         if order_col:
             order_series = normalize_date(result[order_col])
             if order_start is not None:
-                result = result[order_series >= order_start]
+                result = result.loc[order_series >= order_start]
                 order_series = order_series.loc[result.index]
             if order_end is not None:
-                result = result[order_series <= order_end]
+                result = result.loc[order_series <= order_end]
 
         if visit_col:
             visit_series = normalize_date(result[visit_col])
             if visit_start is not None:
-                result = result[visit_series >= visit_start]
+                result = result.loc[visit_series >= visit_start]
                 visit_series = visit_series.loc[result.index]
             if visit_end is not None:
-                result = result[visit_series <= visit_end]
+                result = result.loc[visit_series <= visit_end]
 
         if sms_only and sms_col:
-            result = result[sms_true_mask(result[sms_col])]
+            result = result.loc[sms_true_mask(result[sms_col])]
 
         if exclude_bad and bad_col:
-            result = result[~bad_member_mask(result[bad_col])]
+            result = result.loc[~bad_member_mask(result[bad_col])]
 
-        # 정렬
         sort_map = {
             "실주문금액": amount_col,
             "실결제율": rate_col,
@@ -298,25 +296,28 @@ if uploaded_file is not None:
         }
         target_sort_col = sort_map.get(sort_col)
         if sort_col != "정렬 안함" and target_sort_col:
-            temp_sort = None
             if sort_col == "실결제율":
-                temp_sort = normalize_percent(result[target_sort_col])
+                sort_key = normalize_percent(result[target_sort_col])
             elif sort_col in ["실주문금액", "주문당단가"]:
-                temp_sort = normalize_currency(result[target_sort_col])
+                sort_key = normalize_currency(result[target_sort_col])
             elif sort_col in ["주문일", "접속일"]:
-                temp_sort = pd.to_datetime(result[target_sort_col], errors="coerce")
+                sort_key = pd.to_datetime(result[target_sort_col], errors="coerce")
             else:
-                temp_sort = result[target_sort_col]
+                sort_key = result[target_sort_col]
 
             result = (
-                result.assign(_sort_key=temp_sort)
+                result.assign(_sort_key=sort_key)
                 .sort_values("_sort_key", ascending=(sort_order == "오름차순"))
                 .drop(columns=["_sort_key"])
             )
 
         st.success(f"조건에 맞는 고객 {len(result):,}명")
+
         if len(result) == 0:
-            st.info("입력한 항목만 필터에 적용됩니다. 일부 조건을 비우면 더 넓게 추출할 수 있습니다.")
+            st.info(
+                "이번 수정으로 실결제율 소수값(예: 0.77)을 77%로 자동 보정합니다. "
+                "그래도 0명이면 조건 자체가 좁은 경우입니다."
+            )
 
         st.dataframe(result, use_container_width=True, height=420)
 
